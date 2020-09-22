@@ -20,27 +20,28 @@ package org.apache.spark.sql.hive
 import java.util.{ArrayList => JAList, List => JList}
 
 import scala.collection.JavaConverters._
-
 import org.apache.hadoop.hive.ql.security.authorization.plugin.{HivePrivilegeObject => HPO}
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.{HivePrivilegeObjectType, HivePrivObjectActionType}
-
-import org.apache.spark.sql.SaveMode
+import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.{HivePrivObjectActionType, HivePrivilegeObjectType}
+import org.apache.spark.sql.{SaveMode, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.NamedExpression
+import org.apache.spark.sql.catalyst.optimizer.Authorizer.spark
 import org.apache.spark.sql.catalyst.optimizer.HivePrivilegeObject
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.hive.AuthzUtils._
-import org.apache.spark.sql.hive.execution.CreateHiveTableAsSelectCommand
+import org.apache.spark.sql.hive.execution.{CreateHiveTableAsSelectCommand, InsertIntoHiveTable}
 import org.apache.spark.sql.types.StructField
 
 /**
  * [[LogicalPlan]] -> list of [[HivePrivilegeObject]]s
  */
 private[sql] object PrivilegesBuilder {
+
+  private lazy val spark: SparkSession = SparkSession.builder().getOrCreate()
 
   /**
    * Build input and output privilege objects from a Spark's [[LogicalPlan]]
@@ -82,7 +83,8 @@ private[sql] object PrivilegesBuilder {
   private[this] def buildQuery(
       plan: LogicalPlan,
       hivePrivilegeObjects: JList[HPO],
-      projectionList: Seq[NamedExpression] = Nil): Unit = {
+      projectionList: Seq[NamedExpression] = Nil,
+      actionType: Option[HivePrivObjectActionType] = Option.empty): Unit = {
 
     /**
      * Columns in Projection take priority for column level privilege checking
@@ -94,13 +96,15 @@ private[sql] object PrivilegesBuilder {
           table.identifier,
           hivePrivilegeObjects,
           table.partitionColumnNames,
-          table.schema.fieldNames)
+          table.schema.fieldNames,
+          actionType = actionType)
       } else {
         addTableOrViewLevelObjs(
           table.identifier,
           hivePrivilegeObjects,
           table.partitionColumnNames.filter(projectionList.map(_.name).contains(_)),
-          projectionList.map(_.name))
+          projectionList.map(_.name),
+          actionType = actionType)
       }
     }
 
@@ -112,7 +116,7 @@ private[sql] object PrivilegesBuilder {
 
       case m if m.nodeName == "MetastoreRelation" =>
         mergeProjection(getFieldVal(m, "catalogTable").asInstanceOf[CatalogTable])
-      
+
       case c if c.nodeName == "CatalogRelation" =>
         mergeProjection(getFieldVal(c, "tableMeta").asInstanceOf[CatalogTable])
 
@@ -123,11 +127,11 @@ private[sql] object PrivilegesBuilder {
         // Unfortunately, the real world is always a place where miracles happen.
         // We check the privileges directly without resolving the plan and leave everything
         // to spark to do.
-        addTableOrViewLevelObjs(u.tableIdentifier, hivePrivilegeObjects)
+        addTableOrViewLevelObjs(u.tableIdentifier, hivePrivilegeObjects, actionType = actionType)
 
       case p =>
         for (child <- p.children) {
-          buildQuery(child, hivePrivilegeObjects, projectionList)
+          buildQuery(child, hivePrivilegeObjects, projectionList, actionType = actionType)
         }
     }
   }
@@ -293,7 +297,9 @@ private[sql] object PrivilegesBuilder {
         i.logicalRelation.catalogTable.foreach { table =>
           addTableOrViewLevelObjs(
             table.identifier,
-            outputObjs)
+            outputObjs,
+            actionType = Option(getHivePrivObjActionType(i.overwrite))
+          )
         }
         buildQuery(i.query, inputObjs)
 
@@ -311,22 +317,23 @@ private[sql] object PrivilegesBuilder {
             t.identifier,
             outputObjs,
             i.partitionColumns.map(_.name),
-            t.schema.fieldNames)
+            t.schema.fieldNames,
+            actionType = Option(getHivePrivObjActionType(i.mode)))
         }
         buildQuery(i.query, inputObjs)
 
       case i if i.nodeName == "InsertIntoHiveDirCommand" =>
         buildQuery(getFieldVal(i, "query").asInstanceOf[LogicalPlan], inputObjs)
 
-      case i if i.nodeName == "InsertIntoHiveTable" =>
+      case i: InsertIntoHiveTable =>
         addTableOrViewLevelObjs(
-          getFieldVal(i, "table").asInstanceOf[CatalogTable].identifier, outputObjs)
+          i.table.identifier, outputObjs, actionType = Option(getHivePrivObjActionType(i.overwrite)))
         buildQuery(getFieldVal(i, "query").asInstanceOf[LogicalPlan], inputObjs)
 
       case l: LoadDataCommand => addTableOrViewLevelObjs(l.table, outputObjs)
 
-      case s if s.nodeName == "SaveIntoDataSourceCommand" =>
-        buildQuery(getFieldVal(s, "query").asInstanceOf[LogicalPlan], outputObjs)
+      case i: SaveIntoDataSourceCommand =>
+        buildQuery(i.query, outputObjs, actionType = Option(getHivePrivObjActionType(i.mode)))
 
       case s: SetDatabaseCommand => addDbLevelObjs(s.databaseName, inputObjs)
 
@@ -412,6 +419,7 @@ private[sql] object PrivilegesBuilder {
    *                        privilege object
    * @param hivePrivilegeObjects input or output list
    * @param mode Append or overwrite
+   * @param actionType Action type of input or output object
    */
   private def addTableOrViewLevelObjs(
       tableIdentifier: TableIdentifier,
@@ -419,11 +427,16 @@ private[sql] object PrivilegesBuilder {
       partKeys: Seq[String] = Nil,
       columns: Seq[String] = Nil,
       mode: SaveMode = SaveMode.ErrorIfExists,
-      cmdParams: Seq[String] = Nil): Unit = {
+      cmdParams: Seq[String] = Nil,
+      actionType: Option[HivePrivObjectActionType] = Option.empty): Unit = {
+    val tbName = tableIdentifier.table
+    val hivePrivObjectActionType = if (actionType.isEmpty) {
+      getHivePrivObjActionType(mode)
+    } else {
+      actionType.get
+    }
     tableIdentifier.database match {
       case Some(db) =>
-        val tbName = tableIdentifier.table
-        val hivePrivObjectActionType = getHivePrivObjActionType(mode)
         hivePrivilegeObjects.add(
           HivePrivilegeObject(
             HivePrivilegeObjectType.TABLE_OR_VIEW,
@@ -434,6 +447,16 @@ private[sql] object PrivilegesBuilder {
             hivePrivObjectActionType,
             cmdParams.asJava))
       case _ =>
+        val dbName = spark.catalog.currentDatabase
+        hivePrivilegeObjects.add(
+          HivePrivilegeObject(
+            HivePrivilegeObjectType.TABLE_OR_VIEW,
+            dbName,
+            tbName,
+            partKeys.asJava,
+            columns.asJava,
+            hivePrivObjectActionType,
+            cmdParams.asJava))
     }
   }
 
@@ -466,6 +489,20 @@ private[sql] object PrivilegesBuilder {
       case SaveMode.Append => HivePrivObjectActionType.INSERT
       case SaveMode.Overwrite => HivePrivObjectActionType.INSERT_OVERWRITE
       case _ => HivePrivObjectActionType.OTHER
+    }
+  }
+
+  /**
+   * HivePrivObjectActionType INSERT or INSERT_OVERWRITE
+   *
+   * @param overwrite Overwrite existing table or partitions
+   * @return
+   */
+  private def getHivePrivObjActionType(overwrite: Boolean): HivePrivObjectActionType = {
+    if (overwrite) {
+      HivePrivObjectActionType.INSERT_OVERWRITE
+    } else {
+      HivePrivObjectActionType.INSERT
     }
   }
 }

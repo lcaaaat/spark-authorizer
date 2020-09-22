@@ -1,0 +1,36 @@
+apply plugin: 'java'
+apply plugin: 'scala'
+
+group = 'yaooqinn'
+version = '2.1.2'
+
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+tasks.withType(JavaCompile) {
+  options.encoding = 'UTF-8'
+}
+
+def versions = [
+    "spark"      : "2.3.1",
+    "sparkHive"  : "1.2.1.spark2",
+    "scalaBinary": "2.11",
+    "scala"      : "2.11.8"
+]
+
+repositories {
+  maven { url "https://maven.aliyun.com/repository/google" }
+  maven { url "https://maven.aliyun.com/repository/jcenter" }
+  maven { url "http://conjars.org/repo" }
+  maven { url "https://repo.maven.apache.org/maven2" }
+  maven { url "http://repository.apache.org/snapshots" }
+}
+dependencies {
+  testCompile("org.scalatest:scalatest_${versions['scalaBinary']}:2.2.6")
+  testCompile("org.apache.spark:spark-core_${versions['scalaBinary']}:${versions['spark']}")
+  testCompile("org.apache.spark:spark-catalyst_${versions['scalaBinary']}:${versions['spark']}")
+  testCompile("org.apache.spark:spark-sql_${versions['scalaBinary']}:${versions['spark']}")
+  compileOnly("org.scala-lang:scala-library:${versions['scala']}")
+  compileOnly("org.apache.spark:spark-sql_${versions['scalaBinary']}:${versions['spark']}")
+  compileOnly("org.apache.spark:spark-hive_${versions['scalaBinary']}:${versions['spark']}")
+  compileOnly("org.spark-project.hive:hive-exec:${versions['sparkHive']}")
+}

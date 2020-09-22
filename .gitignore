@@ -73,6 +73,8 @@ streaming-tests.log
 target/
 unit-tests.log
 work/
+.gradle
+build
 
 # For Hive
 TempStatsStore/
